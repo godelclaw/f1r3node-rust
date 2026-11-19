@@ -1,0 +1,353 @@
+new nextToken, skipComment, scanWord, scanString, readHex, readUnicode, encodeScalar,
+    lowerTerm, parseTerm, parseItems, parseForms, atomTerm, numberShape, readInteger in {
+  contract nextToken(@source, @pos, ret) = {
+    if (pos == source.length()) {
+      ret!(("eof", pos))
+    } else {
+      match source.slice(pos, pos + 1).bytesToHex() {
+        "20" => nextToken!(source, pos + 1, *ret)
+        "09" => nextToken!(source, pos + 1, *ret)
+        "0a" => nextToken!(source, pos + 1, *ret)
+        "0d" => nextToken!(source, pos + 1, *ret)
+        "3b" => skipComment!(source, pos + 1, *ret)
+        "28" => ret!(("token", "open", "", pos, pos + 1))
+        "29" => ret!(("token", "close", "", pos, pos + 1))
+        "22" => scanString!(source, pos, pos + 1, pos + 1, "", *ret)
+        _ => scanWord!(source, pos, pos + 1, *ret)
+      }
+    }
+  } |
+
+  contract skipComment(@source, @pos, ret) = {
+    if (pos == source.length()) {
+      ret!(("eof", pos))
+    } else {
+      match source.slice(pos, pos + 1).bytesToHex() {
+        "0a" => nextToken!(source, pos + 1, *ret)
+        "0d" => nextToken!(source, pos + 1, *ret)
+        _ => skipComment!(source, pos + 1, *ret)
+      }
+    }
+  } |
+
+  contract scanWord(@source, @start, @pos, ret) = {
+    if (pos == source.length() or
+        Set("20", "09", "0a", "0d", "3b", "28", "29", "22")
+          .contains(source.slice(pos, pos + 1).bytesToHex())) {
+      ret!(("token", "word", source.slice(start, pos).decodeUtf8(), start, pos))
+    } else {
+      scanWord!(source, start, pos + 1, *ret)
+    }
+  } |
+
+  contract scanString(@source, @start, @segment, @pos, @prefix, ret) = {
+    if (pos == source.length()) {
+      ret!(("error", start, "unterminated string"))
+    } else {
+      match source.slice(pos, pos + 1).bytesToHex() {
+        "22" => {
+          ret!(("token", "string", prefix ++ source.slice(segment, pos).decodeUtf8(),
+                start, pos + 1))
+        }
+        "5c" => {
+          match {"22": "22", "5c": "5c", "2f": "2f", "62": "08", "66": "0c",
+                 "6e": "0a", "72": "0d", "74": "09", "75": "unicode"}
+                   .getOrElse(source.slice(pos + 1, pos + 2).bytesToHex(), "") {
+            "" => ret!(("error", pos, "unsupported string escape"))
+            "unicode" => {
+              new unicode in {
+                readUnicode!(source, pos + 2, *unicode) |
+                for (@result <- unicode) {
+                  match result {
+                    ("ok", text, next) => {
+                      scanString!(source, start, next, next,
+                                  prefix ++ source.slice(segment, pos).decodeUtf8() ++ text, *ret)
+                    }
+                    _ => ret!(result)
+                  }
+                }
+              }
+            }
+            hex => {
+              scanString!(source, start, pos + 2, pos + 2,
+                          prefix ++ source.slice(segment, pos).decodeUtf8()
+                            ++ hex.hexToBytes().decodeUtf8(), *ret)
+            }
+          }
+        }
+        byte => {
+          if (Set("0", "1").contains(byte.slice(0, 1))) {
+            ret!(("error", pos, "unescaped control character in string"))
+          } else {
+            scanString!(source, start, segment, pos + 1, prefix, *ret)
+          }
+        }
+      }
+    }
+  } |
+
+  contract readHex(@source, @pos, @remaining, @acc, ret) = {
+    if (remaining == 0) {
+      ret!(("hex", acc, pos))
+    } else {
+      match {
+        "30": 0, "31": 1, "32": 2, "33": 3, "34": 4, "35": 5, "36": 6, "37": 7,
+        "38": 8, "39": 9, "61": 10, "62": 11, "63": 12, "64": 13, "65": 14, "66": 15,
+        "41": 10, "42": 11, "43": 12, "44": 13, "45": 14, "46": 15
+      }.getOrElse(source.slice(pos, pos + 1).bytesToHex(), -1) {
+        -1 => ret!(("error", pos, "expected four hexadecimal digits in Unicode escape"))
+        digit => readHex!(source, pos + 1, remaining - 1, acc * 16 + digit, *ret)
+      }
+    }
+  } |
+
+  contract readUnicode(@source, @pos, ret) = {
+    new first in {
+      readHex!(source, pos, 4, 0, *first) |
+      for (@result <- first) {
+        match result {
+          ("hex", scalar, end) => {
+            if (scalar >= 55296 and scalar <= 56319) {
+              if (source.slice(end, end + 2).bytesToHex() == "5c75") {
+                new second in {
+                  readHex!(source, end + 2, 4, 0, *second) |
+                  for (@lowResult <- second) {
+                    match lowResult {
+                      ("hex", low, next) => {
+                        if (low >= 56320 and low <= 57343) {
+                          encodeScalar!(65536 + (scalar - 55296) * 1024 + low - 56320, next, *ret)
+                        } else {
+                          ret!(("error", end + 2, "expected a low surrogate"))
+                        }
+                      }
+                      _ => ret!(lowResult)
+                    }
+                  }
+                }
+              } else {
+                ret!(("error", end, "expected a low surrogate escape"))
+              }
+            } else {
+              if (scalar >= 56320 and scalar <= 57343) {
+                ret!(("error", pos, "unexpected low surrogate"))
+              } else {
+                encodeScalar!(scalar, end, *ret)
+              }
+            }
+          }
+          _ => ret!(result)
+        }
+      }
+    }
+  } |
+
+  contract encodeScalar(@scalar, @next, ret) = {
+    new encoded, encodeBytes in {
+      contract encodeBytes(@bytes, @acc, reply) = {
+        match bytes {
+          [] => reply!(acc.hexToBytes().decodeUtf8())
+          [byte ... rest] => {
+            match ("0123456789abcdef", byte / 16, byte % 16) {
+              (alphabet, high, low) => {
+                encodeBytes!(rest, acc ++ alphabet.slice(high, high + 1)
+                               ++ alphabet.slice(low, low + 1), *reply)
+              }
+            }
+          }
+        }
+      } |
+      if (scalar < 128) {
+        encodeBytes!([scalar], "", *encoded)
+      } else {
+        if (scalar < 2048) {
+          encodeBytes!([192 + scalar / 64, 128 + scalar % 64], "", *encoded)
+        } else {
+          if (scalar < 65536) {
+            encodeBytes!([224 + scalar / 4096, 128 + scalar / 64 % 64, 128 + scalar % 64],
+                           "", *encoded)
+          } else {
+            encodeBytes!([240 + scalar / 262144, 128 + scalar / 4096 % 64,
+                           128 + scalar / 64 % 64, 128 + scalar % 64], "", *encoded)
+          }
+        }
+      } |
+      for (@text <- encoded) { ret!(("ok", text, next)) }
+    }
+  } |
+
+  contract numberShape(@source, @pos, @end, @state, ret) = {
+    if (pos == end) {
+      ret!(state)
+    } else {
+      new kind in {
+        match source.slice(pos, pos + 1).bytesToHex() {
+          "2d" => kind!("sign")
+          "2b" => kind!("sign")
+          "2e" => kind!("dot")
+          "65" => kind!("exponent")
+          "45" => kind!("exponent")
+          byte => {
+            if (Set("30", "31", "32", "33", "34", "35", "36", "37", "38", "39").contains(byte)) {
+              kind!("digit")
+            } else {
+              kind!("other")
+            }
+          }
+        } |
+        for (@charKind <- kind) {
+          match {
+            ("start", "sign"): "sign", ("start", "digit"): "integer", ("start", "dot"): "leadingDot",
+            ("sign", "digit"): "integer", ("sign", "dot"): "leadingDot",
+            ("leadingDot", "digit"): "fraction", ("integer", "digit"): "integer",
+            ("integer", "dot"): "fraction", ("integer", "exponent"): "exponent",
+            ("fraction", "digit"): "fraction", ("fraction", "exponent"): "exponent",
+            ("exponent", "sign"): "exponentSign", ("exponent", "digit"): "real",
+            ("exponentSign", "digit"): "real", ("real", "digit"): "real"
+          }.getOrElse((state, charKind), "symbol") {
+            "symbol" => ret!("symbol")
+            next => numberShape!(source, pos + 1, end, next, *ret)
+          }
+        }
+      }
+    }
+  } |
+
+  contract readInteger(@source, @pos, @end, @acc, @negative, ret) = {
+    if (pos == end) {
+      if (negative) { ret!(("ok", ("I", acc), end)) }
+      else { ret!(("ok", ("I", 0 - acc), end)) }
+    } else {
+      match {"30": 0, "31": 1, "32": 2, "33": 3, "34": 4,
+             "35": 5, "36": 6, "37": 7, "38": 8, "39": 9}
+               .get(source.slice(pos, pos + 1).bytesToHex()) {
+        digit => {
+          if (acc < -922337203685477580 or
+              (acc == -922337203685477580 and (digit == 9 or (digit == 8 and not negative)))) {
+            ret!(("error", pos, "integer outside the signed 64-bit range"))
+          } else {
+            readInteger!(source, pos + 1, end, acc * 10 - digit, negative, *ret)
+          }
+        }
+      }
+    }
+  } |
+
+  contract atomTerm(@source, @word, @start, @end, ret) = {
+    match word {
+      "&self" => ret!(("ok", ("Space", 0), end))
+      "true" => ret!(("ok", ("B", true), end))
+      "True" => ret!(("ok", ("B", true), end))
+      "false" => ret!(("ok", ("B", false), end))
+      "False" => ret!(("ok", ("B", false), end))
+      "$_" => ret!(("ok", ("V", (" anonymous ${pos}" %% {"pos": start}, 0)), end))
+      _ => {
+        if (end > start + 1 and source.slice(start, start + 1).bytesToHex() == "24") {
+          ret!(("ok", ("V", (source.slice(start + 1, end).decodeUtf8(), 0)), end))
+        } else {
+          new shape in {
+            numberShape!(source, start, end, "start", *shape) |
+            for (@form <- shape) {
+              match form {
+                "integer" => {
+                  match source.slice(start, start + 1).bytesToHex() {
+                    "2d" => readInteger!(source, start + 1, end, 0, true, *ret)
+                    "2b" => readInteger!(source, start + 1, end, 0, false, *ret)
+                    _ => readInteger!(source, start, end, 0, false, *ret)
+                  }
+                }
+                "fraction" => ret!(("error", start, "floating-point literals are unsupported"))
+                "real" => ret!(("error", start, "floating-point literals are unsupported"))
+                _ => ret!(("ok", ("S", word), end))
+              }
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract lowerTerm(@source, @token, ret) = {
+    match token {
+      ("token", "open", _, start, next) => parseItems!(source, start, next, [], *ret)
+      ("token", "close", _, start, _) => ret!(("error", start, "unexpected closing parenthesis"))
+      ("token", "string", value, _, next) => ret!(("ok", ("Str", value), next))
+      ("token", "word", "!", _, next) => {
+        new parsed in {
+          parseTerm!(source, next, *parsed) |
+          for (@result <- parsed) {
+            match result {
+              ("ok", term, end) => ret!(("ok", ("E", [("S", "!"), term]), end))
+              _ => ret!(result)
+            }
+          }
+        }
+      }
+      ("token", "word", value, start, end) => atomTerm!(source, value, start, end, *ret)
+      ("eof", pos) => ret!(("error", pos, "expected a term"))
+      _ => ret!(token)
+    }
+  } |
+
+  contract parseTerm(@source, @pos, ret) = {
+    new token in {
+      nextToken!(source, pos, *token) |
+      for (@item <- token) { lowerTerm!(source, item, *ret) }
+    }
+  } |
+
+  contract parseItems(@source, @start, @pos, @items, ret) = {
+    new token in {
+      nextToken!(source, pos, *token) |
+      for (@item <- token) {
+        match item {
+          ("eof", _) => ret!(("error", start, "unclosed opening parenthesis"))
+          ("token", "close", _, _, end) => ret!(("ok", ("E", items), end))
+          _ => {
+            new parsed in {
+              lowerTerm!(source, item, *parsed) |
+              for (@result <- parsed) {
+                match result {
+                  ("ok", term, next) => parseItems!(source, start, next, items ++ [term], *ret)
+                  _ => ret!(result)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract parseForms(@source, @pos, @forms, ret) = {
+    new token in {
+      nextToken!(source, pos, *token) |
+      for (@item <- token) {
+        match item {
+          ("eof", _) => ret!(("ok", forms))
+          _ => {
+            new parsed in {
+              lowerTerm!(source, item, *parsed) |
+              for (@result <- parsed) {
+                match result {
+                  ("ok", ("E", [("S", "!"), term]), next) => {
+                    parseForms!(source, next, forms ++ [("eval", term)], *ret)
+                  }
+                  ("ok", term, next) => parseForms!(source, next, forms ++ [("facts", [term])], *ret)
+                  _ => ret!(result)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract @"__METTA_READ"(@source, ret) = {
+    if (source.validUtf8PrefixLen() == source.length()) {
+      parseForms!(source, 0, [], *ret)
+    } else {
+      ret!(("error", source.validUtf8PrefixLen(), "invalid UTF-8"))
+    }
+  }
+}

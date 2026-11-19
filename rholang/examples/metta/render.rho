@@ -1,0 +1,83 @@
+new renderAtom, renderList, renderString, escapeByte in {
+  contract escapeByte(@byte, ret) = {
+    match {"22": "5c22", "5c": "5c5c", "08": "5c62", "09": "5c74",
+           "0a": "5c6e", "0c": "5c66", "0d": "5c72"}.getOrElse(byte, "") {
+      "" => {
+        if (Set("0", "1").contains(byte.slice(0, 1))) {
+          ret!("5c753030" ++ byte.toUtf8Bytes().bytesToHex())
+        }
+        else { ret!("") }
+      }
+      escape => ret!(escape)
+    }
+  } |
+
+  contract renderString(@bytes, @pos, @segment, @prefix, ret) = {
+    if (pos == bytes.length()) {
+      ret!(prefix ++ bytes.slice(segment, pos).decodeUtf8() ++ "22".hexToBytes().decodeUtf8())
+    } else {
+      new escaped in {
+        escapeByte!(bytes.slice(pos, pos + 1).bytesToHex(), *escaped) |
+        for (@escape <- escaped) {
+          if (escape == "") {
+            renderString!(bytes, pos + 1, segment, prefix, *ret)
+          } else {
+            renderString!(bytes, pos + 1, pos + 1, prefix
+                            ++ bytes.slice(segment, pos).decodeUtf8()
+                            ++ escape.hexToBytes().decodeUtf8(), *ret)
+          }
+        }
+      }
+    }
+  } |
+
+  contract renderAtom(@term, @dialect, ret) = {
+    match term {
+      ("S", word) => ret!(word)
+      ("V", (name, _)) => {
+        if (name.toUtf8Bytes().slice(0, 1).bytesToHex() == "20") { ret!("$_") }
+        else { ret!("$" ++ name) }
+      }
+      ("I", value) => ret!("${value}" %% {"value": value})
+      ("B", value) => {
+        if (dialect == "he") {
+          if (value) { ret!("True") } else { ret!("False") }
+        } else {
+          ret!("${value}" %% {"value": value})
+        }
+      }
+      ("Str", value) => renderString!(value.toUtf8Bytes(), 0, 0,
+                                      "22".hexToBytes().decodeUtf8(), *ret)
+      ("Space", 0) => ret!("&self")
+      ("Space", id) => ret!("<Space:${id}>" %% {"id": id})
+      ("State", id) => ret!("<State:${id}>" %% {"id": id})
+      ("E", items) => {
+        new rendered in {
+          renderList!(items, dialect, " ", "", "", *rendered) |
+          for (@text <- rendered) { ret!("(" ++ text ++ ")") }
+        }
+      }
+    }
+  } |
+
+  contract renderList(@terms, @dialect, @sep, @prefix, @joiner, ret) = {
+    match terms {
+      [] => ret!(prefix)
+      [term ... rest] => {
+        new rendered in {
+          renderAtom!(term, dialect, *rendered) |
+          for (@text <- rendered) {
+            renderList!(rest, dialect, sep, prefix ++ joiner ++ text, sep, *ret)
+          }
+        }
+      }
+    }
+  } |
+
+  contract @"__METTA_RENDER"(@answers, @dialect, ret) = {
+    new rendered in {
+      renderList!(answers, dialect, ", ", "", "", *rendered) |
+      for (@text <- rendered) { ret!("[" ++ text ++ "]") }
+    }
+  }
+}

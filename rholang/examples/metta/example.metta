@@ -1,0 +1,6 @@
+!(collapse (match &self (tag $x) $x))
+(tag later)
+!(collapse (match &self (tag $x) $x))
+!(+ 10 (superpose (1 1 2)))
+!(empty)
+!(collapse (empty))

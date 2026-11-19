@@ -1,0 +1,1322 @@
+new
+  freshSuffix, freshen, freshenList,
+  deref, derefList, occurs, occursList, unify, unifyList,
+  spaceSnapshot, removeFirstAtom, removeMatchingAtoms,
+  matchOneAtom, matchConj, matchConjSubs,
+  lookupParamTypes, isErrorAtom, hasErrorAnswer,
+  evalArgs, prependArgToTuples, evalArgsBind,
+  tryBuiltin, dedupAtoms, listContains,
+  findMatchingRules, hasAnyRuleForHead, derefRuleBranches, evalRuleBranches,
+  dispatchCall, dispatchCallTuples,
+  evalAtom, evalHeadBagCalls, evalSuperposeList,
+  extractDerefVals, wrapAtomsWithSubst, evalBagOnce,
+  evalIfBranches, evalLetBranches, evalProgn, evalPrognBranches,
+  evalCaseBag, evalCaseItem, evalUnifyForm,
+  evalMatchSpaces, evalMatchTemplates, runForms, done
+in {
+  @"__fresh"!(1) |
+  @"__next_space"!(1) |
+  @"__next_state"!(1) |
+  @("__space", 0)!([]) |
+
+  contract freshSuffix(ret) = {
+    for (@n <- @"__fresh") {
+      @"__fresh"!(n + 1) |
+      ret!(n)
+    }
+  } |
+
+  contract freshen(@term, @sfx, ret) = {
+    match term {
+      ("V", (name, _)) => ret!(("V", (name, sfx)))
+      ("E", elems) => {
+        freshenList!(elems, sfx, *ret)
+      }
+      _ => ret!(term)
+    }
+  } |
+
+  contract freshenList(@elems, @sfx, ret) = {
+    match elems {
+      [] => ret!(("E", []))
+      [h ... t] => {
+        new rh, rt in {
+          freshen!(h, sfx, *rh) |
+          freshenList!(t, sfx, *rt) |
+          for (@dh <- rh & @("E", dt) <- rt) {
+            ret!(("E", [dh] ++ dt))
+          }
+        }
+      }
+    }
+  } |
+
+  contract deref(@term, @subst, ret) = {
+    match term {
+      ("V", name) => {
+        if (subst.contains(name)) {
+          deref!(subst.get(name), subst, *ret)
+        } else {
+          ret!(term)
+        }
+      }
+      ("E", elems) => {
+        new rlist in {
+          derefList!(elems, subst, *rlist) |
+          for (@delems <- rlist) {
+            ret!(("E", delems))
+          }
+        }
+      }
+      _ => ret!(term)
+    }
+  } |
+
+  contract derefList(@elems, @subst, ret) = {
+    match elems {
+      [] => ret!([])
+      [h ... t] => {
+        new rh, rt in {
+          deref!(h, subst, *rh) |
+          derefList!(t, subst, *rt) |
+          for (@dh <- rh & @dt <- rt) {
+            ret!([dh] ++ dt)
+          }
+        }
+      }
+    }
+  } |
+
+  contract occurs(@vname, @term, @subst, ret) = {
+    new rd in {
+      deref!(term, subst, *rd) |
+      for (@d <- rd) {
+        match d {
+          ("V", n) => ret!(n == vname)
+          ("E", elems) => occursList!(vname, elems, subst, *ret)
+          _ => ret!(false)
+        }
+      }
+    }
+  } |
+
+  contract occursList(@vname, @elems, @subst, ret) = {
+    match elems {
+      [] => ret!(false)
+      [h ... t] => {
+        new rh in {
+          occurs!(vname, h, subst, *rh) |
+          for (@oh <- rh) {
+            if (oh) {
+              ret!(true)
+            } else {
+              occursList!(vname, t, subst, *ret)
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract unify(@t1, @t2, @subst, ret) = {
+    new r1, r2 in {
+      deref!(t1, subst, *r1) |
+      deref!(t2, subst, *r2) |
+      for (@d1 <- r1 & @d2 <- r2) {
+        if (d1 == d2) {
+          ret!(("Some", subst))
+        } else {
+          match (d1, d2) {
+            (("V", n1), _) => {
+              new rocc in {
+                occurs!(n1, d2, subst, *rocc) |
+                for (@occ <- rocc) {
+                  if (occ) {
+                    ret!("None")
+                  } else {
+                    ret!(("Some", subst.set(n1, d2)))
+                  }
+                }
+              }
+            }
+            (_, ("V", n2)) => {
+              new rocc in {
+                occurs!(n2, d1, subst, *rocc) |
+                for (@occ <- rocc) {
+                  if (occ) {
+                    ret!("None")
+                  } else {
+                    ret!(("Some", subst.set(n2, d1)))
+                  }
+                }
+              }
+            }
+            (("E", xs), ("E", ys)) => {
+              if (xs.length() == ys.length()) {
+                unifyList!(xs, ys, subst, *ret)
+              } else {
+                ret!("None")
+              }
+            }
+            _ => ret!("None")
+          }
+        }
+      }
+    }
+  } |
+
+  contract unifyList(@xs, @ys, @subst, ret) = {
+    match (xs, ys) {
+      ([], []) => ret!(("Some", subst))
+      ([xh ... xt], [yh ... yt]) => {
+        new rhead in {
+          unify!(xh, yh, subst, *rhead) |
+          for (@u <- rhead) {
+            match u {
+              ("Some", s2) => unifyList!(xt, yt, s2, *ret)
+              _ => ret!("None")
+            }
+          }
+        }
+      }
+      _ => ret!("None")
+    }
+  } |
+
+  contract spaceSnapshot(@spId, ret) = {
+    for (@atoms <<- @("__space", spId)) {
+      ret!(atoms)
+    }
+  } |
+
+  contract removeFirstAtom(@atoms, @target, ret) = {
+    match atoms {
+      [] => ret!((false, []))
+      [h ... t] => {
+        if (h == target) {
+          match t {
+            [] => ret!((true, []))
+            _ => {
+              let @last <- t.length() - 1 in {
+                ret!((true, [t.nth(last)] ++ t.slice(0, last)))
+              }
+            }
+          }
+        } else {
+          new rtail in {
+            removeFirstAtom!(t, target, *rtail) |
+            for (@(removed, rest) <- rtail) {
+              ret!((removed, [h] ++ rest))
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract removeMatchingAtoms(@atoms, @target, ret) = {
+    match atoms {
+      [] => ret!((false, []))
+      [h ... t] => {
+        new matchCh, tailCh in {
+          matchOneAtom!([h], target, {}, *matchCh) |
+          removeMatchingAtoms!(t, target, *tailCh) |
+          for (@matched <- matchCh & @(removed, rest) <- tailCh) {
+            match matched {
+              [] => ret!((removed, [h] ++ rest))
+              _ => ret!((true, rest))
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract matchOneAtom(@atoms, @pat, @subst, ret) = {
+    match atoms {
+      [] => ret!([])
+      [a ... rest] => {
+        new sfxCh in {
+          freshSuffix!(*sfxCh) |
+          for (@sfx <- sfxCh) {
+            new faCh in {
+              freshen!(a, sfx, *faCh) |
+              for (@fa <- faCh) {
+                new uCh, restCh in {
+                  unify!(pat, fa, subst, *uCh) |
+                  matchOneAtom!(rest, pat, subst, *restCh) |
+                  for (@ures <- uCh & @rsubs <- restCh) {
+                    match ures {
+                      ("Some", s2) => ret!([s2] ++ rsubs)
+                      _ => ret!(rsubs)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract matchConj(@atoms, @pats, @subst, ret) = {
+    match pats {
+      [] => ret!([subst])
+      [p ... ps] => {
+        new r1 in {
+          matchOneAtom!(atoms, p, subst, *r1) |
+          for (@subs1 <- r1) {
+            matchConjSubs!(atoms, ps, subs1, *ret)
+          }
+        }
+      }
+    }
+  } |
+
+  contract matchConjSubs(@atoms, @pats, @subs, ret) = {
+    match subs {
+      [] => ret!([])
+      [s ... rest] => {
+        new rhead, rtail in {
+          matchConj!(atoms, pats, s, *rhead) |
+          matchConjSubs!(atoms, pats, rest, *rtail) |
+          for (@h <- rhead & @t <- rtail) {
+            ret!(h ++ t)
+          }
+        }
+      }
+    }
+  } |
+
+  contract lookupParamTypes(@atoms, @fnSym, ret) = {
+    match atoms {
+      [] => ret!("None")
+      [a ... rest] => {
+        match a {
+          ("E", [("S", ":"), fnAtom, ("E", arrowItems)]) => {
+            if (fnAtom == fnSym and arrowItems.length() >= 2 and arrowItems.nth(0) == ("S", "->")) {
+              ret!(("Some", arrowItems.slice(1, arrowItems.length() - 1), arrowItems.nth(arrowItems.length() - 1)))
+            } else {
+              lookupParamTypes!(rest, fnSym, *ret)
+            }
+          }
+          _ => lookupParamTypes!(rest, fnSym, *ret)
+        }
+      }
+    }
+  } |
+
+  contract isErrorAtom(@a, ret) = {
+    match a {
+      ("E", [("S", "Error") ... _]) => ret!(true)
+      _ => ret!(false)
+    }
+  } |
+
+  contract hasErrorAnswer(@vals, ret) = {
+    match vals {
+      [] => ret!(false)
+      [("E", [("S", "Error") ... _]) ... _] => ret!(true)
+      [_ ... rest] => hasErrorAnswer!(rest, *ret)
+    }
+  } |
+
+  contract evalArgs(@args, @paramTypes, @idx, @subst, @dialect, ret) = {
+    match args {
+      [] => ret!([([], subst, false)])
+      [arg ... restArgs] => {
+        new holdCh in {
+          match (dialect, paramTypes) {
+            ("he", ("Some", ptypes, _)) => {
+              if (idx < ptypes.length() and ptypes.nth(idx) == ("S", "Atom")) {
+                holdCh!(true)
+              } else {
+                holdCh!(false)
+              }
+            }
+            _ => holdCh!(false)
+          } |
+          for (@shouldHold <- holdCh) {
+            if (shouldHold) {
+              new dCh in {
+                deref!(arg, subst, *dCh) |
+                for (@darg <- dCh) {
+                  new tailCh in {
+                    evalArgs!(restArgs, paramTypes, idx + 1, subst, dialect, *tailCh) |
+                    for (@tailTuples <- tailCh) {
+                      prependArgToTuples!(darg, tailTuples, *ret)
+                    }
+                  }
+                }
+              }
+            } else {
+              new headBagCh in {
+                evalAtom!(arg, subst, dialect, *headBagCh) |
+                for (@headBag <- headBagCh) {
+                  evalArgsBind!(headBag, restArgs, paramTypes, idx + 1, dialect, *ret)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract prependArgToTuples(@val, @tuples, ret) = {
+    match tuples {
+      [] => ret!([])
+      [(vals, s, isErr) ... rest] => {
+        new rrest in {
+          prependArgToTuples!(val, rest, *rrest) |
+          for (@tailOut <- rrest) {
+            if (isErr) {
+              ret!([(vals, s, true)] ++ tailOut)
+            } else {
+              ret!([([val] ++ vals, s, false)] ++ tailOut)
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalArgsBind(@headBag, @restArgs, @paramTypes, @nextIdx, @dialect, ret) = {
+    match headBag {
+      [] => ret!([])
+      [(hval, hsubst) ... restHead] => {
+        new errCh, restOutCh in {
+          isErrorAtom!(hval, *errCh) |
+          evalArgsBind!(restHead, restArgs, paramTypes, nextIdx, dialect, *restOutCh) |
+          for (@isErr <- errCh & @restOut <- restOutCh) {
+            if (dialect == "he" and isErr) {
+              ret!([([hval], hsubst, true)] ++ restOut)
+            } else {
+              new tailCh in {
+                evalArgs!(restArgs, paramTypes, nextIdx, hsubst, dialect, *tailCh) |
+                for (@tailTuples <- tailCh) {
+                  new prepCh in {
+                    prependArgToTuples!(hval, tailTuples, *prepCh) |
+                    for (@prepOut <- prepCh) {
+                      ret!(prepOut ++ restOut)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract tryBuiltin(@headAtom, @evaledArgs, @subst, @dialect, ret) = {
+    match (headAtom, evaledArgs) {
+      (("S", "+"), [("I", a), ("I", b)]) => ret!(("Handled", [(("I", a + b), subst)]))
+      (("S", "-"), [("I", a), ("I", b)]) => ret!(("Handled", [(("I", a - b), subst)]))
+      (("S", "*"), [("I", a), ("I", b)]) => ret!(("Handled", [(("I", a * b), subst)]))
+      (("S", "/"), [("I", a), ("I", b)]) => {
+        if (b == 0) {
+          ret!(("Handled", [(("E", [("S", "Error"), ("E", [headAtom] ++ evaledArgs), ("S", "DivisionByZero")]), subst)]))
+        } else {
+          ret!(("Handled", [(("I", a / b), subst)]))
+        }
+      }
+      (("S", "%"), [("I", a), ("I", b)]) => {
+        if (b == 0) {
+          ret!(("Handled", [(("E", [("S", "Error"), ("E", [headAtom] ++ evaledArgs), ("S", "DivisionByZero")]), subst)]))
+        } else {
+          ret!(("Handled", [(("I", a % b), subst)]))
+        }
+      }
+      (("S", "<"), [("I", a), ("I", b)]) => ret!(("Handled", [(("B", a < b), subst)]))
+      (("S", "<="), [("I", a), ("I", b)]) => ret!(("Handled", [(("B", a <= b), subst)]))
+      (("S", ">"), [("I", a), ("I", b)]) => ret!(("Handled", [(("B", a > b), subst)]))
+      (("S", ">="), [("I", a), ("I", b)]) => ret!(("Handled", [(("B", a >= b), subst)]))
+      (("S", "=="), [a, b]) => {
+        new d1Ch, d2Ch in {
+          deref!(a, subst, *d1Ch) |
+          deref!(b, subst, *d2Ch) |
+          for (@d1 <- d1Ch & @d2 <- d2Ch) {
+            ret!(("Handled", [(("B", d1 == d2), subst)]))
+          }
+        }
+      }
+      (("S", "!="), [a, b]) => {
+        new d1Ch, d2Ch in {
+          deref!(a, subst, *d1Ch) |
+          deref!(b, subst, *d2Ch) |
+          for (@d1 <- d1Ch & @d2 <- d2Ch) {
+            ret!(("Handled", [(("B", d1 != d2), subst)]))
+          }
+        }
+      }
+      (("S", "and"), [("B", a), ("B", b)]) => ret!(("Handled", [(("B", a and b), subst)]))
+      (("S", "or"), [("B", a), ("B", b)]) => ret!(("Handled", [(("B", a or b), subst)]))
+      (("S", "not"), [("B", a)]) => ret!(("Handled", [(("B", not a), subst)]))
+      (("S", "cons-atom"), [h, ("E", t)]) => ret!(("Handled", [(("E", [h] ++ t), subst)]))
+      (("S", "decons-atom"), [("E", [h ... t])]) => ret!(("Handled", [(("E", [h, ("E", t)]), subst)]))
+      (("S", "car-atom"), [("E", [h ... _])]) => ret!(("Handled", [(h, subst)]))
+      (("S", "cdr-atom"), [("E", [_ ... t])]) => ret!(("Handled", [(("E", t), subst)]))
+      (("S", "cdr-atom"), [_]) => {
+        if (dialect == "petta") {
+          ret!(("Handled", [(("E", []), subst)]))
+        } else {
+          ret!(("Handled", [(("E", [("S", "Error"), ("E", [headAtom] ++ evaledArgs),
+            ("Str", "cdr-atom expects a non-empty expression as an argument")]), subst)]))
+        }
+      }
+      (("S", "size-atom"), [("E", xs)]) => ret!(("Handled", [(("I", xs.length()), subst)]))
+      (("S", "index-atom"), [("E", xs), ("I", i)]) => {
+        if (i >= 0 and i < xs.length()) {
+          ret!(("Handled", [(xs.nth(i), subst)]))
+        } else {
+          ret!(("Handled", []))
+        }
+      }
+      (("S", "unique-atom"), [("E", xs)]) => {
+        new uCh in {
+          dedupAtoms!(xs, [], *uCh) |
+          for (@uxs <- uCh) {
+            ret!(("Handled", [(("E", uxs), subst)]))
+          }
+        }
+      }
+      _ => ret!("NotBuiltin")
+    }
+  } |
+
+  contract dedupAtoms(@xs, @seen, ret) = {
+    match xs {
+      [] => ret!([])
+      [h ... t] => {
+        new memCh in {
+          listContains!(seen, h, *memCh) |
+          for (@already <- memCh) {
+            if (already) {
+              dedupAtoms!(t, seen, *ret)
+            } else {
+              new tailCh in {
+                dedupAtoms!(t, seen ++ [h], *tailCh) |
+                for (@rest <- tailCh) {
+                  ret!([h] ++ rest)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract listContains(@xs, @item, ret) = {
+    match xs {
+      [] => ret!(false)
+      [h ... t] => {
+        if (h == item) {
+          ret!(true)
+        } else {
+          listContains!(t, item, *ret)
+        }
+      }
+    }
+  } |
+
+  contract findMatchingRules(@atoms, @callTerm, @subst, ret) = {
+    match atoms {
+      [] => ret!([])
+      [a ... rest] => {
+        match a {
+          ("E", [("S", "="), lhs, rhs]) => {
+            new sfxCh in {
+              freshSuffix!(*sfxCh) |
+              for (@sfx <- sfxCh) {
+                new frCh, tailCh in {
+                  freshen!(("E", [lhs, rhs]), sfx, *frCh) |
+                  findMatchingRules!(rest, callTerm, subst, *tailCh) |
+                  for (@("E", [flhs, frhs]) <- frCh & @tailMatches <- tailCh) {
+                    new uCh in {
+                      unify!(callTerm, flhs, subst, *uCh) |
+                      for (@ures <- uCh) {
+                        match ures {
+                          ("Some", s2) => ret!([(frhs, s2)] ++ tailMatches)
+                          _ => ret!(tailMatches)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          _ => findMatchingRules!(rest, callTerm, subst, *ret)
+        }
+      }
+    }
+  } |
+
+  contract hasAnyRuleForHead(@atoms, @headVal, ret) = {
+    match atoms {
+      [] => ret!(false)
+      [a ... rest] => {
+        match a {
+          ("E", [("S", "="), ("E", [h ... _]), _]) => {
+            if (h == headVal) {
+              ret!(true)
+            } else {
+              hasAnyRuleForHead!(rest, headVal, *ret)
+            }
+          }
+          _ => hasAnyRuleForHead!(rest, headVal, *ret)
+        }
+      }
+    }
+  } |
+
+  contract derefRuleBranches(@branches, ret) = {
+    match branches {
+      [] => ret!([])
+      [(rhs, s2) ... rest] => {
+        new dCh, tCh in {
+          deref!(rhs, s2, *dCh) |
+          derefRuleBranches!(rest, *tCh) |
+          for (@drhs <- dCh & @tb <- tCh) {
+            ret!([(drhs, s2)] ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalRuleBranches(@branches, @dialect, ret) = {
+    match branches {
+      [] => ret!([])
+      [(rhs, s2) ... rest] => {
+        new hCh, tCh in {
+          evalAtom!(rhs, s2, dialect, *hCh) |
+          evalRuleBranches!(rest, dialect, *tCh) |
+          for (@hb <- hCh & @tb <- tCh) {
+            ret!(hb ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract dispatchCall(@headVal, @argVals, @subst, @isErr, @ptypes, @atoms, @dialect, ret) = {
+    if (isErr) {
+      ret!([(argVals.nth(0), subst)])
+    } else {
+      new bCh in {
+        tryBuiltin!(headVal, argVals, subst, dialect, *bCh) |
+        for (@bres <- bCh) {
+          match bres {
+            ("Handled", outBag) => ret!(outBag)
+            _ => {
+              new dCallCh in {
+                deref!(("E", [headVal] ++ argVals), subst, *dCallCh) |
+                for (@callTerm <- dCallCh) {
+                  new rulesCh in {
+                    findMatchingRules!(atoms, callTerm, subst, *rulesCh) |
+                    for (@matchedRules <- rulesCh) {
+                      match matchedRules {
+                        [] => {
+                          if (dialect == "petta") {
+                            new hasCh in {
+                              hasAnyRuleForHead!(atoms, headVal, *hasCh) |
+                              for (@hasAny <- hasCh) {
+                                if (hasAny) {
+                                  ret!([])
+                                } else {
+                                  ret!([(callTerm, subst)])
+                                }
+                              }
+                            }
+                          } else {
+                            ret!([(callTerm, subst)])
+                          }
+                        }
+                        _ => {
+                          match (dialect, ptypes) {
+                            ("he", ("Some", _, ("S", "Atom"))) => derefRuleBranches!(matchedRules, *ret)
+                            _ => evalRuleBranches!(matchedRules, dialect, *ret)
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract dispatchCallTuples(@headVal, @argTuples, @ptypes, @atoms, @dialect, ret) = {
+    match argTuples {
+      [] => ret!([])
+      [(argVals, s, isErr) ... rest] => {
+        new hCh, tCh in {
+          dispatchCall!(headVal, argVals, s, isErr, ptypes, atoms, dialect, *hCh) |
+          dispatchCallTuples!(headVal, rest, ptypes, atoms, dialect, *tCh) |
+          for (@hb <- hCh & @tb <- tCh) {
+            ret!(hb ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalAtom(@term, @subst, @dialect, ret) = {
+    new dCh in {
+      deref!(term, subst, *dCh) |
+      for (@dterm <- dCh) {
+        match dterm {
+          ("E", []) => ret!([(dterm, subst)])
+          ("E", [("S", "quote"), x]) => ret!([(x, subst)])
+          ("E", [("S", "empty")]) => ret!([])
+          ("E", [("S", "nop"), x]) => {
+            new xCh in {
+              evalAtom!(x, subst, dialect, *xCh) |
+              for (@_ <- xCh) {
+                ret!([(("E", []), subst)])
+              }
+            }
+          }
+          ("E", [("S", "eval"), target]) => {
+            if (dialect == "he") {
+              evalBagOnce!([(target, subst)], dialect, *ret)
+            } else {
+              new tCh in {
+                evalAtom!(target, subst, dialect, *tCh) |
+                for (@tBag <- tCh) {
+                  evalBagOnce!(tBag, dialect, *ret)
+                }
+              }
+            }
+          }
+          ("E", [("S", "superpose"), ("E", items)]) => {
+            evalSuperposeList!(items, subst, dialect, *ret)
+          }
+          ("E", [("S", "collapse"), inner]) => {
+            new bCh in {
+              evalAtom!(inner, subst, dialect, *bCh) |
+              for (@bag <- bCh) {
+                new valsCh in {
+                  extractDerefVals!(bag, *valsCh) |
+                  for (@vals <- valsCh) {
+                    ret!([(("E", vals), subst)])
+                  }
+                }
+              }
+            }
+          }
+          ("E", [("S", "once"), inner]) => {
+            new bCh in {
+              evalAtom!(inner, subst, dialect, *bCh) |
+              for (@bag <- bCh) {
+                match bag {
+                  [] => ret!([])
+                  [first ... _] => ret!([first])
+                }
+              }
+            }
+          }
+          ("E", [("S", "if"), condExpr, thenExpr, elseExpr]) => {
+            new cCh in {
+              evalAtom!(condExpr, subst, dialect, *cCh) |
+              for (@cBag <- cCh) {
+                evalIfBranches!(cBag, thenExpr, elseExpr, dialect, *ret)
+              }
+            }
+          }
+          ("E", [("S", "let"), pat, valExpr, bodyExpr]) => {
+            new vCh in {
+              evalAtom!(valExpr, subst, dialect, *vCh) |
+              for (@vBag <- vCh) {
+                evalLetBranches!(vBag, pat, bodyExpr, dialect, *ret)
+              }
+            }
+          }
+          ("E", [("S", "chain"), valExpr, varAtom, bodyExpr]) => {
+            new vCh in {
+              evalAtom!(valExpr, subst, dialect, *vCh) |
+              for (@vBag <- vCh) {
+                evalLetBranches!(vBag, varAtom, bodyExpr, dialect, *ret)
+              }
+            }
+          }
+          ("E", [("S", "let*"), ("E", bindings), bodyExpr]) => {
+            match bindings {
+              [] => evalAtom!(bodyExpr, subst, dialect, *ret)
+              [("E", [p, v]) ... restBinds] => {
+                evalAtom!(
+                  ("E", [("S", "let"), p, v, ("E", [("S", "let*"), ("E", restBinds), bodyExpr])]),
+                  subst,
+                  dialect,
+                  *ret
+                )
+              }
+              _ => ret!([])
+            }
+          }
+          ("E", [("S", "progn") ... exprs]) => {
+            evalProgn!(exprs, subst, dialect, *ret)
+          }
+          ("E", [("S", "case"), scrExpr, ("E", branches)]) => {
+            new sCh in {
+              evalAtom!(scrExpr, subst, dialect, *sCh) |
+              for (@sBag <- sCh) {
+                match sBag {
+                  [] => evalCaseItem!(("S", "Empty"), subst, branches, dialect, *ret)
+                  _ => evalCaseBag!(sBag, branches, dialect, *ret)
+                }
+              }
+            }
+          }
+          ("E", [("S", "unify"), target, pat, thenExpr, elseExpr]) => {
+            new tCh in {
+              evalAtom!(target, subst, dialect, *tCh) |
+              for (@tBag <- tCh) {
+                evalUnifyForm!(tBag, pat, thenExpr, elseExpr, dialect, *ret)
+              }
+            }
+          }
+          ("E", [("S", "match"), spaceExpr, pat, tmpl]) => {
+            new spCh in {
+              evalAtom!(spaceExpr, subst, dialect, *spCh) |
+              for (@spBag <- spCh) {
+                evalMatchSpaces!(spBag, pat, tmpl, dialect, *ret)
+              }
+            }
+          }
+          ("E", [("S", "new-space")]) => {
+            for (@id <- @"__next_space") {
+              @"__next_space"!(id + 1) |
+              @("__space", id)!([]) |
+              ret!([(("Space", id), subst)])
+            }
+          }
+          ("E", [("S", "add-atom"), spaceExpr, atomArg]) => {
+            new spCh in {
+              evalAtom!(spaceExpr, subst, dialect, *spCh) |
+              for (@spBag <- spCh) {
+                match spBag {
+                  [(("Space", spId), s2) ... _] => {
+                    new dAtomCh in {
+                      deref!(atomArg, s2, *dAtomCh) |
+                      for (@datom <- dAtomCh) {
+                        for (@atoms <- @("__space", spId)) {
+                          @("__space", spId)!(atoms ++ [datom]) |
+                          if (dialect == "petta") {
+                            ret!([(("B", true), s2)])
+                          } else {
+                            ret!([(("E", []), s2)])
+                          }
+                        }
+                      }
+                    }
+                  }
+                  _ => ret!([])
+                }
+              }
+            }
+          }
+          ("E", [("S", "remove-atom"), spaceExpr, atomArg]) => {
+            new spCh in {
+              evalAtom!(spaceExpr, subst, dialect, *spCh) |
+              for (@spBag <- spCh) {
+                match spBag {
+                  [(("Space", spId), s2) ... _] => {
+                    new dAtomCh in {
+                      deref!(atomArg, s2, *dAtomCh) |
+                      for (@datom <- dAtomCh) {
+                        for (@atoms <- @("__space", spId)) {
+                          new remCh in {
+                            if (dialect == "petta") {
+                              removeMatchingAtoms!(atoms, datom, *remCh)
+                            } else {
+                              removeFirstAtom!(atoms, datom, *remCh)
+                            } |
+                            for (@(removed, newAtoms) <- remCh) {
+                              @("__space", spId)!(newAtoms) |
+                              if (dialect == "petta") {
+                                ret!([(("B", removed), s2)])
+                              } else {
+                                ret!([(("E", []), s2)])
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                  _ => ret!([])
+                }
+              }
+            }
+          }
+          ("E", [("S", "get-atoms"), spaceExpr]) => {
+            new spCh in {
+              evalAtom!(spaceExpr, subst, dialect, *spCh) |
+              for (@spBag <- spCh) {
+                match spBag {
+                  [(("Space", spId), s2) ... _] => {
+                    new snapCh in {
+                      spaceSnapshot!(spId, *snapCh) |
+                      for (@atoms <- snapCh) {
+                        wrapAtomsWithSubst!(atoms, s2, *ret)
+                      }
+                    }
+                  }
+                  _ => ret!([])
+                }
+              }
+            }
+          }
+          ("E", [("S", "new-state"), initExpr]) => {
+            new vCh in {
+              evalAtom!(initExpr, subst, dialect, *vCh) |
+              for (@vBag <- vCh) {
+                match vBag {
+                  [(val, s2) ... _] => {
+                    for (@sid <- @"__next_state") {
+                      @"__next_state"!(sid + 1) |
+                      @("__state", sid)!(val) |
+                      ret!([(("State", sid), s2)])
+                    }
+                  }
+                  _ => ret!([])
+                }
+              }
+            }
+          }
+          ("E", [("S", "get-state"), stateExpr]) => {
+            new stCh in {
+              evalAtom!(stateExpr, subst, dialect, *stCh) |
+              for (@stBag <- stCh) {
+                match stBag {
+                  [(("State", sid), s2) ... _] => {
+                    for (@val <<- @("__state", sid)) {
+                      ret!([(val, s2)])
+                    }
+                  }
+                  _ => ret!([])
+                }
+              }
+            }
+          }
+          ("E", [("S", "change-state!"), stateExpr, newValExpr]) => {
+            new stCh in {
+              evalAtom!(stateExpr, subst, dialect, *stCh) |
+              for (@stBag <- stCh) {
+                match stBag {
+                  [(("State", sid), s2) ... _] => {
+                    new nvCh in {
+                      evalAtom!(newValExpr, s2, dialect, *nvCh) |
+                      for (@nvBag <- nvCh) {
+                        match nvBag {
+                          [(nval, s3) ... _] => {
+                            for (@_ <- @("__state", sid)) {
+                              @("__state", sid)!(nval) |
+                              ret!([(("State", sid), s3)])
+                            }
+                          }
+                          _ => ret!([])
+                        }
+                      }
+                    }
+                  }
+                  _ => ret!([])
+                }
+              }
+            }
+          }
+          ("E", [headExpr ... argExprs]) => {
+            new snapCh, headBagCh in {
+              spaceSnapshot!(0, *snapCh) |
+              evalAtom!(headExpr, subst, dialect, *headBagCh) |
+              for (@atoms <- snapCh & @headBag <- headBagCh) {
+                evalHeadBagCalls!(headBag, argExprs, atoms, dialect, *ret)
+              }
+            }
+          }
+          ("S", symName) => ret!([(dterm, subst)])
+          _ => ret!([(dterm, subst)])
+        }
+      }
+    }
+  } |
+
+  contract evalHeadBagCalls(@headBag, @argExprs, @atoms, @dialect, ret) = {
+    match headBag {
+      [] => ret!([])
+      [(hval, hsubst) ... restHeads] => {
+        new ptCh, restCh in {
+          if (dialect == "he") {
+            lookupParamTypes!(atoms, hval, *ptCh)
+          } else {
+            ptCh!("None")
+          } |
+          evalHeadBagCalls!(restHeads, argExprs, atoms, dialect, *restCh) |
+          for (@ptypes <- ptCh & @restOut <- restCh) {
+            new argsCh in {
+              evalArgs!(argExprs, ptypes, 0, hsubst, dialect, *argsCh) |
+              for (@argTuples <- argsCh) {
+                new dispCh in {
+                  dispatchCallTuples!(hval, argTuples, ptypes, atoms, dialect, *dispCh) |
+                  for (@dispOut <- dispCh) {
+                    ret!(dispOut ++ restOut)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalSuperposeList(@items, @subst, @dialect, ret) = {
+    match items {
+      [] => ret!([])
+      [h ... t] => {
+        new hCh, tCh in {
+          evalAtom!(h, subst, dialect, *hCh) |
+          evalSuperposeList!(t, subst, dialect, *tCh) |
+          for (@hb <- hCh & @tb <- tCh) {
+            ret!(hb ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract extractDerefVals(@bag, ret) = {
+    match bag {
+      [] => ret!([])
+      [(v, s) ... rest] => {
+        new dvCh, tailCh in {
+          deref!(v, s, *dvCh) |
+          extractDerefVals!(rest, *tailCh) |
+          for (@dv <- dvCh & @tv <- tailCh) {
+            ret!([dv] ++ tv)
+          }
+        }
+      }
+    }
+  } |
+
+  contract wrapAtomsWithSubst(@atoms, @subst, ret) = {
+    match atoms {
+      [] => ret!([])
+      [a ... rest] => {
+        new tailCh in {
+          wrapAtomsWithSubst!(rest, subst, *tailCh) |
+          for (@tb <- tailCh) {
+            ret!([(a, subst)] ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalBagOnce(@bag, @dialect, ret) = {
+    match bag {
+      [] => ret!([])
+      [(v, s) ... rest] => {
+        new hCh, tCh in {
+          match v {
+            ("S", _) => {
+              new snapCh in {
+                spaceSnapshot!(0, *snapCh) |
+                for (@atoms <- snapCh) {
+                  new rulesCh in {
+                    findMatchingRules!(atoms, v, s, *rulesCh) |
+                    for (@matchedRules <- rulesCh) {
+                      match matchedRules {
+                        [] => hCh!([(v, s)])
+                        _ => derefRuleBranches!(matchedRules, *hCh)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            _ => evalAtom!(v, s, dialect, *hCh)
+          } |
+          evalBagOnce!(rest, dialect, *tCh) |
+          for (@hb <- hCh & @tb <- tCh) {
+            ret!(hb ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalIfBranches(@cBag, @thenExpr, @elseExpr, @dialect, ret) = {
+    match cBag {
+      [] => ret!([])
+      [(cval, csubst) ... rest] => {
+        new hCh, tCh in {
+          match cval {
+            ("B", true) => evalAtom!(thenExpr, csubst, dialect, *hCh)
+            ("B", false) => evalAtom!(elseExpr, csubst, dialect, *hCh)
+            _ => hCh!([(("E", [("S", "if"), cval, thenExpr, elseExpr]), csubst)])
+          } |
+          evalIfBranches!(rest, thenExpr, elseExpr, dialect, *tCh) |
+          for (@hb <- hCh & @tb <- tCh) {
+            ret!(hb ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalLetBranches(@vBag, @pat, @bodyExpr, @dialect, ret) = {
+    match vBag {
+      [] => ret!([])
+      [(val, vsubst) ... rest] => {
+        new uCh, tCh in {
+          unify!(pat, val, vsubst, *uCh) |
+          evalLetBranches!(rest, pat, bodyExpr, dialect, *tCh) |
+          for (@ures <- uCh & @tb <- tCh) {
+            match ures {
+              ("Some", s2) => {
+                new bCh in {
+                  evalAtom!(bodyExpr, s2, dialect, *bCh) |
+                  for (@hb <- bCh) {
+                    ret!(hb ++ tb)
+                  }
+                }
+              }
+              _ => ret!(tb)
+            }
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalProgn(@exprs, @subst, @dialect, ret) = {
+    match exprs {
+      [] => ret!([(("E", []), subst)])
+      [last] => evalAtom!(last, subst, dialect, *ret)
+      [first ... rest] => {
+        new fCh in {
+          evalAtom!(first, subst, dialect, *fCh) |
+          for (@fBag <- fCh) {
+            evalPrognBranches!(fBag, rest, dialect, *ret)
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalPrognBranches(@fBag, @rest, @dialect, ret) = {
+    match fBag {
+      [] => ret!([])
+      [(_, s2) ... tailBag] => {
+        new hCh, tCh in {
+          evalProgn!(rest, s2, dialect, *hCh) |
+          evalPrognBranches!(tailBag, rest, dialect, *tCh) |
+          for (@hb <- hCh & @tb <- tCh) {
+            ret!(hb ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalCaseBag(@sBag, @branches, @dialect, ret) = {
+    match sBag {
+      [] => ret!([])
+      [(sval, ssubst) ... rest] => {
+        new hCh, tCh in {
+          evalCaseItem!(sval, ssubst, branches, dialect, *hCh) |
+          evalCaseBag!(rest, branches, dialect, *tCh) |
+          for (@hb <- hCh & @tb <- tCh) {
+            ret!(hb ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalCaseItem(@sval, @ssubst, @branches, @dialect, ret) = {
+    match branches {
+      [] => ret!([])
+      [("E", [pat, rhs]) ... rest] => {
+        new sfxCh in {
+          freshSuffix!(*sfxCh) |
+          for (@sfx <- sfxCh) {
+            new fpCh in {
+              freshen!(("E", [pat, rhs]), sfx, *fpCh) |
+              for (@("E", [fpat, frhs]) <- fpCh) {
+                new uCh in {
+                  unify!(sval, fpat, ssubst, *uCh) |
+                  for (@ures <- uCh) {
+                    match ures {
+                      ("Some", s2) => evalAtom!(frhs, s2, dialect, *ret)
+                      _ => evalCaseItem!(sval, ssubst, rest, dialect, *ret)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      _ => ret!([])
+    }
+  } |
+
+  contract evalUnifyForm(@tBag, @pat, @thenExpr, @elseExpr, @dialect, ret) = {
+    match tBag {
+      [] => ret!([])
+      [(tval, tsubst) ... rest] => {
+        new hCh, restCh in {
+          match tval {
+            ("Space", spId) => {
+              new snapCh in {
+                spaceSnapshot!(spId, *snapCh) |
+                for (@atoms <- snapCh) {
+                  new mCh in {
+                    matchConj!(atoms, [pat], tsubst, *mCh) |
+                    for (@subs <- mCh) {
+                      match subs {
+                        [] => evalAtom!(elseExpr, tsubst, dialect, *hCh)
+                        _ => evalMatchTemplates!(subs, thenExpr, dialect, *hCh)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            _ => {
+              new uCh in {
+                unify!(tval, pat, tsubst, *uCh) |
+                for (@ures <- uCh) {
+                  match ures {
+                    ("Some", s2) => evalAtom!(thenExpr, s2, dialect, *hCh)
+                    _ => evalAtom!(elseExpr, tsubst, dialect, *hCh)
+                  }
+                }
+              }
+            }
+          } |
+          evalUnifyForm!(rest, pat, thenExpr, elseExpr, dialect, *restCh) |
+          for (@hb <- hCh & @tb <- restCh) {
+            ret!(hb ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract evalMatchSpaces(@spBag, @pat, @tmpl, @dialect, ret) = {
+    match spBag {
+      [] => ret!([])
+      [(("Space", spId), s2) ... rest] => {
+        new snapCh, restCh in {
+          spaceSnapshot!(spId, *snapCh) |
+          evalMatchSpaces!(rest, pat, tmpl, dialect, *restCh) |
+          for (@atoms <- snapCh & @tb <- restCh) {
+            new patsCh in {
+              match pat {
+                ("E", [("S", ",") ... conjPats]) => patsCh!(conjPats)
+                _ => patsCh!([pat])
+              } |
+              for (@pats <- patsCh) {
+                new mCh in {
+                  matchConj!(atoms, pats, s2, *mCh) |
+                  for (@subs <- mCh) {
+                    new tmplCh in {
+                      evalMatchTemplates!(subs, tmpl, dialect, *tmplCh) |
+                      for (@hb <- tmplCh) {
+                        ret!(hb ++ tb)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      [_ ... rest] => evalMatchSpaces!(rest, pat, tmpl, dialect, *ret)
+    }
+  } |
+
+  contract evalMatchTemplates(@subs, @tmpl, @dialect, ret) = {
+    match subs {
+      [] => ret!([])
+      [s ... rest] => {
+        new hCh, tCh in {
+          evalAtom!(tmpl, s, dialect, *hCh) |
+          evalMatchTemplates!(rest, tmpl, dialect, *tCh) |
+          for (@hb <- hCh & @tb <- tCh) {
+            ret!(hb ++ tb)
+          }
+        }
+      }
+    }
+  } |
+
+  contract runForms(@forms, @idx, @dialect, done) = {
+    match forms {
+      [] => done!(idx)
+      [("facts", block) ... rest] => {
+        for (@atoms <- @("__space", 0)) {
+          @("__space", 0)!(atoms ++ block) |
+          runForms!(rest, idx, dialect, *done)
+        }
+      }
+      [("eval", d) ... rest] => {
+        new bCh in {
+          evalAtom!(d, {}, dialect, *bCh) |
+          for (@bag <- bCh) {
+            new valsCh in {
+              extractDerefVals!(bag, *valsCh) |
+              for (@vals <- valsCh) {
+                new rendered in {
+                  @"__METTA_RENDER"!(vals, dialect, *rendered) |
+                  for (@text <- rendered) {
+                    @"__METTA_OUT"!(idx, text.toUtf8Bytes().bytesToHex())
+                  }
+                } |
+                if (dialect == "he") {
+                  new errCh in {
+                    hasErrorAnswer!(vals, *errCh) |
+                    for (@stop <- errCh) {
+                      if (stop) { done!(idx + 1) }
+                      else { runForms!(rest, idx + 1, dialect, *done) }
+                    }
+                  }
+                } else {
+                  runForms!(rest, idx + 1, dialect, *done)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  |
+  for (@count <- done) { @"__METTA_DONE"!(count) } |
+  for (@hex, @dialect <- @"__METTA_SOURCE") {
+    new parsed in {
+      @"__METTA_READ"!(hex.hexToBytes(), *parsed) |
+      for (@result <- parsed) {
+        match result {
+          ("ok", forms) => runForms!(forms, 0, dialect, *done)
+          ("error", pos, reason) => @"__METTA_ERROR"!(pos, reason)
+        }
+      }
+    }
+  }
+}
